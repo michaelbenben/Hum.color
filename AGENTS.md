@@ -6,7 +6,7 @@
 source .venv/bin/activate && streamlit run app.py
 ```
 
-App is served at http://localhost:8501. Use `--server.headless true` when launching in background/no TTY (otherwise Streamlit prompts for email and blocks).
+App is served at http://localhost:8501. Light mode and headless mode are set in `.streamlit/config.toml` (no CLI flags needed).
 
 ## Stack
 
