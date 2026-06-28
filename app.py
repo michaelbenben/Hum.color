@@ -4,7 +4,7 @@ import os
 import tempfile
 from dataclasses import dataclass
 from fractions import Fraction
-from typing import Iterator, Optional, Tuple
+from typing import Optional, Tuple
 
 import av
 import cv2
@@ -35,15 +35,15 @@ class ExportPreset:
 
 EXPORT_PRESETS = {
     "original": ExportPreset("Tel quel", "original", None, None),
-    "linkedin": ExportPreset("LinkedIn feed", "linkedin", (1200, 628), (1920, 1080)),
-    "instagram": ExportPreset("Instagram feed", "instagram", (1080, 1350), (1080, 1350)),
-    "facebook": ExportPreset("Facebook feed", "facebook", (1080, 1350), (1080, 1350)),
+    "linkedin": ExportPreset("LinkedIn", "linkedin", (1200, 628), (1920, 1080)),
+    "instagram": ExportPreset("Instagram", "instagram", (1080, 1350), (1080, 1350)),
+    "facebook": ExportPreset("Facebook", "facebook", (1080, 1350), (1080, 1350)),
 }
 EXPORT_BUTTONS = (
-    ("original", "+", "Aucun changement\nde format"),
-    ("facebook", "f", "Facebook"),
-    ("instagram", "◎", "Instagram"),
-    ("linkedin", "in", "LinkedIn"),
+    ("original", "T", "Tel quel", "Aucun changement\nde format"),
+    ("facebook", "f", "Facebook", "1080 x 1350"),
+    ("instagram", "@", "Instagram", "1080 x 1350"),
+    ("linkedin", "in", "LinkedIn", "1920 x 1080"),
 )
 
 
@@ -105,6 +105,19 @@ def resize_contain(rgb_image: np.ndarray, target_width: int, target_height: int)
     return resized, x_offset, y_offset
 
 
+def make_blurred_background(rgb_image: np.ndarray, target_width: int, target_height: int) -> np.ndarray:
+    cover = resize_cover(rgb_image, target_width, target_height)
+    height, width = cover.shape[:2]
+    scale = 0.25
+    small = cv2.resize(
+        cover,
+        (max(1, round(width * scale)), max(1, round(height * scale))),
+        interpolation=cv2.INTER_AREA,
+    )
+    small = cv2.GaussianBlur(small, (0, 0), sigmaX=18 * scale, sigmaY=18 * scale)
+    return cv2.resize(small, (width, height), interpolation=cv2.INTER_LINEAR)
+
+
 def adapt_to_social_canvas(image: np.ndarray, target_size: Optional[Tuple[int, int]]) -> np.ndarray:
     if target_size is None:
         return image
@@ -113,8 +126,7 @@ def adapt_to_social_canvas(image: np.ndarray, target_size: Optional[Tuple[int, i
     has_alpha = image.ndim == 3 and image.shape[2] == 4
     rgb_image = image[:, :, :3] if has_alpha else image
 
-    background = resize_cover(rgb_image, target_width, target_height)
-    background = cv2.GaussianBlur(background, (0, 0), sigmaX=18, sigmaY=18)
+    background = make_blurred_background(rgb_image, target_width, target_height)
     foreground, x_offset, y_offset = resize_contain(rgb_image, target_width, target_height)
 
     canvas = background.copy()
@@ -188,16 +200,16 @@ def make_red_mask(rgb_frame: np.ndarray, hsv: np.ndarray, settings: ProcessingSe
     mask = cv2.bitwise_or(mask_a, mask_b)
 
     red = rgb_frame[:, :, 0].astype(np.int16)
-    green = rgb_frame[:, :, 1].astype(np.int16)
-    blue = rgb_frame[:, :, 2].astype(np.int16)
-    red_dominance_mask = ((red - green) >= settings.red_dominance) & ((red - blue) >= settings.red_dominance)
+    diff = red - rgb_frame[:, :, 1]
+    red_dominance_mask = diff >= settings.red_dominance
+    diff = red - rgb_frame[:, :, 2]
+    red_dominance_mask &= diff >= settings.red_dominance
     mask = cv2.bitwise_and(mask, (red_dominance_mask.astype(np.uint8) * 255))
 
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
 
     if settings.dilation_iterations > 0:
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         mask = cv2.dilate(mask, kernel, iterations=settings.dilation_iterations)
 
     return cv2.GaussianBlur(mask, (7, 7), 0)
@@ -207,22 +219,12 @@ def recolor_blood_frame(rgb_frame: np.ndarray, settings: ProcessingSettings) -> 
     hsv = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2HSV)
     mask = make_red_mask(rgb_frame, hsv, settings)
 
-    violet_hsv = hsv.copy()
-    violet_hsv[:, :, 0] = VIOLET_HUE
-    recolored_rgb = cv2.cvtColor(violet_hsv, cv2.COLOR_HSV2RGB)
+    hsv[:, :, 0] = VIOLET_HUE
+    recolored_rgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
 
     alpha = (mask.astype(np.float32) / 255.0)[:, :, None]
     blended = rgb_frame.astype(np.float32) * (1.0 - alpha) + recolored_rgb.astype(np.float32) * alpha
     return np.clip(blended, 0, 255).astype(np.uint8)
-
-
-def frame_generator(input_path: str, settings: ProcessingSettings) -> Iterator[Tuple[av.VideoFrame, np.ndarray]]:
-    with av.open(input_path) as input_container:
-        video_stream = first_video_stream(input_container)
-        for frame in input_container.decode(video_stream):
-            rgb = frame.to_ndarray(format="rgb24")
-            processed = recolor_blood_frame(rgb, settings)
-            yield frame, processed
 
 
 def extract_preview(input_path: str, settings: ProcessingSettings) -> Tuple[np.ndarray, np.ndarray]:
@@ -262,23 +264,18 @@ def configure_output_stream(
     if bitrate:
         output_stream.bit_rate = bitrate
 
-    if source_stream.codec_context.profile:
-        try:
-            output_stream.codec_context.profile = source_stream.codec_context.profile
-        except (AttributeError, ValueError, TypeError):
-            output_stream.codec_context.options = {
-                **dict(output_stream.codec_context.options or {}),
-                "profile": str(source_stream.codec_context.profile),
-            }
-
     if source_stream.time_base:
         output_stream.time_base = source_stream.time_base
 
-    if source_stream.codec_context.options:
-        output_stream.codec_context.options = {
-            **dict(source_stream.codec_context.options),
-            **dict(output_stream.codec_context.options or {}),
-        }
+    options = dict(source_stream.codec_context.options or {})
+    profile = source_stream.codec_context.profile
+    if profile:
+        options["profile"] = str(profile)
+    if options:
+        try:
+            output_stream.codec_context.options = options
+        except (AttributeError, ValueError, TypeError):
+            pass
 
 
 def process_video(
@@ -294,6 +291,10 @@ def process_video(
         framerate = stream_framerate(source_stream)
         codec_name = codec_name_for_output(source_stream)
 
+        if not total_frames and source_stream.duration and source_stream.time_base and framerate:
+            duration_seconds = float(source_stream.duration * source_stream.time_base)
+            total_frames = max(1, int(duration_seconds * float(framerate)))
+
         with av.open(output_path, mode="w") as output_container:
             try:
                 output_stream = output_container.add_stream(codec_name, rate=framerate)
@@ -304,14 +305,12 @@ def process_video(
             configure_output_stream(output_stream, source_stream, input_container, preset.video_size)
 
             processed_count = 0
-            for source_frame, processed_rgb in frame_generator(input_path, settings):
+            for source_frame in input_container.decode(source_stream):
+                rgb = source_frame.to_ndarray(format="rgb24")
+                processed_rgb = recolor_blood_frame(rgb, settings)
                 processed_rgb = adapt_to_social_canvas(processed_rgb, preset.video_size)
                 output_frame = av.VideoFrame.from_ndarray(processed_rgb, format="rgb24")
-                output_frame = output_frame.reformat(
-                    width=output_stream.width,
-                    height=output_stream.height,
-                    format=output_stream.pix_fmt,
-                )
+                output_frame = output_frame.reformat(format=output_stream.pix_fmt)
                 output_frame.pts = source_frame.pts
                 output_frame.time_base = source_frame.time_base
 
@@ -342,11 +341,11 @@ def render_export_buttons() -> ExportPreset:
     if "export_key" not in st.session_state:
         st.session_state.export_key = "original"
 
-    st.caption("Format d'export")
+    st.markdown("#### Format d'export")
     columns = st.columns(len(EXPORT_BUTTONS))
-    for column, (key, icon, label) in zip(columns, EXPORT_BUTTONS):
+    for column, (key, icon, label, hint) in zip(columns, EXPORT_BUTTONS):
         selected = st.session_state.export_key == key
-        button_label = f"{icon}\n\n{label}"
+        button_label = f"{icon}  {label}"
         if column.button(
             button_label,
             key=f"export_{key}",
@@ -355,138 +354,280 @@ def render_export_buttons() -> ExportPreset:
         ):
             st.session_state.export_key = key
             st.rerun()
+        column.caption(hint)
 
     return EXPORT_PRESETS[st.session_state.export_key]
 
 
 def main() -> None:
-    st.set_page_config(page_title="Hum.Color", layout="wide")
+    st.set_page_config(
+        page_title="Hum.Color",
+        page_icon="🎨",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
     st.markdown(
         """
         <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
+        html, body, [class*="css"] {
+            font-family: 'Inter', sans-serif;
+        }
+
+        .block-container {
+            padding-top: 2.5rem;
+            padding-bottom: 3rem;
+            max-width: 1100px;
+        }
+
+        h1, h2, h3, h4 {
+            letter-spacing: -0.02em;
+        }
+
+        .hero-title {
+            font-size: 2.75rem;
+            font-weight: 800;
+            background: linear-gradient(135deg, #6D28D9 0%, #4C1D95 50%, #A21CAF 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            margin-bottom: 0.5rem;
+            line-height: 1.1;
+        }
+
+        .hero-subtitle {
+            font-size: 1.15rem;
+            color: #6B7280;
+            font-weight: 400;
+            margin-bottom: 2rem;
+        }
+
+        .hero-badge {
+            display: inline-block;
+            background: #F3E8FF;
+            color: #6D28D9;
+            padding: 0.35rem 0.85rem;
+            border-radius: 999px;
+            font-size: 0.8rem;
+            font-weight: 600;
+            margin-bottom: 1rem;
+        }
+
+        .stat-card {
+            background: #FFFFFF;
+            border: 1px solid #E5E7EB;
+            border-radius: 14px;
+            padding: 1.25rem;
+            text-align: center;
+        }
+
+        .stat-card .stat-icon {
+            font-size: 1.6rem;
+            margin-bottom: 0.4rem;
+        }
+
+        .stat-card .stat-label {
+            font-size: 0.85rem;
+            color: #6B7280;
+            font-weight: 500;
+        }
+
+        .empty-zone {
+            border: 2px dashed #D1D5DB;
+            border-radius: 16px;
+            padding: 3rem 2rem;
+            text-align: center;
+            background: #FAFAFA;
+        }
+
+        .empty-zone .empty-icon {
+            font-size: 3rem;
+            margin-bottom: 0.75rem;
+        }
+
+        .empty-zone .empty-text {
+            color: #6B7280;
+            font-size: 1rem;
+        }
+
         div[class*="st-key-export_"] button {
-            min-height: 88px;
-            white-space: pre-line;
-            font-weight: 700;
-            line-height: 1.15;
+            min-height: 72px;
+            font-weight: 600;
+            font-size: 0.95rem;
+            border-radius: 12px;
+        }
+
+        div[data-testid="stSidebar"] {
+            background: #FAFAFA;
+        }
+
+        div[data-testid="stSidebar"] > div:first-child {
+            padding-top: 2rem;
+        }
+
+        .section-label {
+            text-transform: uppercase;
+            font-size: 0.72rem;
+            letter-spacing: 0.08em;
+            color: #9CA3AF;
+            font-weight: 600;
+            margin-bottom: 0.5rem;
         }
         </style>
         """,
         unsafe_allow_html=True,
     )
-    st.title("Hum.Color")
 
-    uploaded_file = st.file_uploader(
-        "Selectionnez une video MP4 ou une photo chirurgicale",
-        type=sorted(VIDEO_EXTENSIONS | IMAGE_EXTENSIONS),
+    with st.sidebar:
+        st.markdown("### Réglages du masque")
+        st.caption("Ajustez la détection du rouge. Les changanges s'appliquent en temps réel sur l'aperçu.")
+        dilation = st.slider(
+            "Dilatation",
+            min_value=0,
+            max_value=8,
+            value=1,
+            help="Augmente la couverture du violet autour des reflets et des zones rouges limites.",
+        )
+        min_saturation = st.slider(
+            "Saturation minimale",
+            min_value=0,
+            max_value=255,
+            value=95,
+            help="Augmentez si la peau, les gants ou les ombres chaudes deviennent violets.",
+        )
+        red_dominance = st.slider(
+            "Dominance rouge",
+            min_value=0,
+            max_value=120,
+            value=35,
+            help="Exige que le canal rouge soit plus fort que les canaux vert et bleu.",
+        )
+        min_value = st.slider(
+            "Luminosité minimale",
+            min_value=0,
+            max_value=255,
+            value=45,
+            help="Évite de recolorer les bruits sombres, tout en gardant les zones de sang peu éclairées.",
+        )
+
+    st.markdown('<div class="hero-badge">🎨 Recoloration chirurgicale</div>', unsafe_allow_html=True)
+    st.markdown('<div class="hero-title">Hum.Color</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="hero-subtitle">Transformez le rouge chirurgicale en violet Humanea sur vos photos et vidéos.</div>',
+        unsafe_allow_html=True,
     )
-    dilation = st.slider(
-        "Dilatation du masque",
-        min_value=0,
-        max_value=8,
-        value=1,
-        help="Augmente la couverture du violet autour des reflets et des zones rouges limites.",
-    )
-    min_saturation = st.slider(
-        "Saturation minimale du sang",
-        min_value=0,
-        max_value=255,
-        value=95,
-        help="Augmentez cette valeur si la peau, les gants ou les ombres chaudes deviennent violets.",
-    )
-    red_dominance = st.slider(
-        "Dominance rouge minimale",
-        min_value=0,
-        max_value=120,
-        value=35,
-        help="Exige que le canal rouge soit plus fort que les canaux vert et bleu.",
-    )
-    min_value = st.slider(
-        "Luminosite minimale",
-        min_value=0,
-        max_value=255,
-        value=45,
-        help="Evite de recolorer certains bruits sombres, tout en gardant les zones de sang peu eclairees.",
-    )
+
     if "export_key" not in st.session_state:
         st.session_state.export_key = "original"
     export_preset = EXPORT_PRESETS[st.session_state.export_key]
 
-    if uploaded_file is not None:
-        settings = ProcessingSettings(
-            dilation_iterations=dilation,
-            min_saturation=min_saturation,
-            min_value=min_value,
-            red_dominance=red_dominance,
+    uploaded_file = st.file_uploader(
+        "Sélectionnez une vidéo MP4 ou une photo chirurgicale",
+        type=sorted(VIDEO_EXTENSIONS | IMAGE_EXTENSIONS),
+        label_visibility="collapsed",
+    )
+
+    if uploaded_file is None:
+        cols = st.columns(3)
+        cards = [
+            ("📤", "Importez", "Glissez votre photo ou vidéo MP4"),
+            ("🎨", "Ajustez", "Réglez la détection du rouge"),
+            ("⬇️", "Exportez", "Téléchargez au format réseau social"),
+        ]
+        for col, (icon, title, desc) in zip(cols, cards):
+            col.markdown(
+                f'<div class="stat-card"><div class="stat-icon">{icon}</div>'
+                f'<div style="font-weight:700;font-size:1rem;margin-bottom:0.2rem">{title}</div>'
+                f'<div class="stat-label">{desc}</div></div>',
+                unsafe_allow_html=True,
+            )
+        st.markdown(
+            '<div class="empty-zone">'
+            '<div class="empty-icon">📁</div>'
+            '<div class="empty-text">Aucun fichier sélectionné. Choisissez une photo ou une vidéo ci-dessus.</div>'
+            '</div>',
+            unsafe_allow_html=True,
         )
+        return
 
-        if is_video_file(uploaded_file):
-            input_path = save_uploaded_file(uploaded_file)
-            output_path = None
+    settings = ProcessingSettings(
+        dilation_iterations=dilation,
+        min_saturation=min_saturation,
+        min_value=min_value,
+        red_dominance=red_dominance,
+    )
 
-            try:
-                before_preview, after_preview = extract_preview(input_path, settings)
-                after_preview = adapt_to_social_canvas(after_preview, export_preset.video_size)
-                st.subheader("Avant / Apres")
-                before_col, after_col = st.columns(2)
-                before_col.image(before_preview, caption="Avant", use_container_width=True)
-                after_col.image(after_preview, caption="Apres", use_container_width=True)
-                export_preset = render_export_buttons()
+    if is_video_file(uploaded_file):
+        input_path = save_uploaded_file(uploaded_file)
+        output_path = None
 
-                if st.button("Transformer la video", type="primary"):
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as output_tmp:
-                        output_path = output_tmp.name
+        try:
+            before_preview, after_preview = extract_preview(input_path, settings)
+            after_preview = adapt_to_social_canvas(after_preview, export_preset.video_size)
+            st.markdown('<div class="section-label">Aperçu</div>', unsafe_allow_html=True)
+            before_col, after_col = st.columns(2)
+            before_col.image(before_preview, caption="Avant", use_container_width=True)
+            after_col.image(after_preview, caption="Après", use_container_width=True)
+            export_preset = render_export_buttons()
 
-                    progress_bar = st.progress(0.0)
-                    with st.spinner("Traitement frame par frame en cours..."):
-                        process_video(input_path, output_path, settings, export_preset, progress_bar)
+            if st.button("🎬 Transformer la vidéo", type="primary", use_container_width=True):
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as output_tmp:
+                    output_path = output_tmp.name
 
-                    with open(output_path, "rb") as processed_file:
-                        processed_bytes = processed_file.read()
+                progress_bar = st.progress(0.0)
+                with st.spinner("Traitement frame par frame en cours..."):
+                    process_video(input_path, output_path, settings, export_preset, progress_bar)
 
-                    remove_temp_file(output_path)
-                    output_path = None
+                with open(output_path, "rb") as processed_file:
+                    processed_bytes = processed_file.read()
 
-                    st.download_button(
-                        "Telecharger la video transformee",
-                        data=processed_bytes,
-                        file_name=f"humcolor_{export_preset.suffix}_{uploaded_file.name}",
-                        mime="video/mp4",
-                    )
-
-                    st.video(processed_bytes)
-
-            except Exception as exc:
-                st.error(f"Le traitement a echoue : {exc}")
-            finally:
-                remove_temp_file(input_path)
                 remove_temp_file(output_path)
-
-        else:
-            try:
-                before_preview = decode_uploaded_image(uploaded_file)
-                processed_image = process_image(before_preview, settings)
-                after_preview = adapt_to_social_canvas(processed_image, export_preset.image_size)
-                image_bytes, output_name, mime = encode_image(after_preview, uploaded_file.name, export_preset)
-
-                st.subheader("Avant / Apres")
-                before_col, after_col = st.columns(2)
-                before_col.image(before_preview, caption="Avant", use_container_width=True)
-                after_col.image(after_preview, caption="Apres", use_container_width=True)
-                export_preset = render_export_buttons()
-                after_preview = adapt_to_social_canvas(processed_image, export_preset.image_size)
-                image_bytes, output_name, mime = encode_image(after_preview, uploaded_file.name, export_preset)
+                output_path = None
 
                 st.download_button(
-                    "Telecharger la photo transformee",
-                    data=image_bytes,
-                    file_name=output_name,
-                    mime=mime,
+                    "⬇️ Télécharger la vidéo transformée",
+                    data=processed_bytes,
+                    file_name=f"humcolor_{export_preset.suffix}_{uploaded_file.name}",
+                    mime="video/mp4",
                     type="primary",
+                    use_container_width=True,
                 )
 
-            except Exception as exc:
-                st.error(f"Le traitement de la photo a echoue : {exc}")
+                st.video(processed_bytes)
+
+        except Exception as exc:
+            st.error(f"Le traitement a échoué : {exc}")
+        finally:
+            remove_temp_file(input_path)
+            remove_temp_file(output_path)
+
+    else:
+        try:
+            before_preview = decode_uploaded_image(uploaded_file)
+            processed_image = process_image(before_preview, settings)
+            after_preview = adapt_to_social_canvas(processed_image, export_preset.image_size)
+            image_bytes, output_name, mime = encode_image(after_preview, uploaded_file.name, export_preset)
+
+            st.markdown('<div class="section-label">Aperçu</div>', unsafe_allow_html=True)
+            before_col, after_col = st.columns(2)
+            before_col.image(before_preview, caption="Avant", use_container_width=True)
+            after_col.image(after_preview, caption="Après", use_container_width=True)
+            export_preset = render_export_buttons()
+            after_preview = adapt_to_social_canvas(processed_image, export_preset.image_size)
+            image_bytes, output_name, mime = encode_image(after_preview, uploaded_file.name, export_preset)
+
+            st.download_button(
+                "⬇️ Télécharger la photo transformée",
+                data=image_bytes,
+                file_name=output_name,
+                mime=mime,
+                type="primary",
+                use_container_width=True,
+            )
+
+        except Exception as exc:
+            st.error(f"Le traitement de la photo a échoué : {exc}")
 
 
 if __name__ == "__main__":
